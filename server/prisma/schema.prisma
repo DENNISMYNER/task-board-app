@@ -1,0 +1,337 @@
+// prisma/schema.prisma
+// Real-time project & task management board (Trello/Linear style)
+//
+// Conventions
+// - UUIDv7 primary keys: native `uuid` column, roughly time-ordered => better index locality than v4.
+//   (uuid(7) needs a recent Prisma 6.x; fall back to uuid() if your version rejects it.)
+// - All timestamps are timestamptz (timezone-aware).
+// - snake_case table names via @@map; camelCase in the Prisma client.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+// Prisma 7: the connection URL no longer lives here. It is configured in prisma.config.ts
+// (for the CLI/migrations) and passed to the client through a driver adapter in src/lib/prisma.ts.
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+  GUEST
+}
+
+// Semantic meaning of a column, so "done" logic survives renames (Linear-style).
+enum StatusCategory {
+  BACKLOG
+  UNSTARTED
+  STARTED
+  COMPLETED
+  CANCELED
+}
+
+// Declaration order = Postgres enum sort order, so ORDER BY priority DESC puts URGENT first.
+enum TaskPriority {
+  NONE
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ActivityAction {
+  WORKSPACE_CREATED
+  WORKSPACE_UPDATED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  MEMBER_ROLE_CHANGED
+  BOARD_CREATED
+  BOARD_UPDATED
+  BOARD_ARCHIVED
+  COLUMN_CREATED
+  COLUMN_UPDATED
+  COLUMN_REORDERED
+  COLUMN_DELETED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_MOVED
+  TASK_ASSIGNED
+  TASK_UNASSIGNED
+  TASK_PRIORITY_CHANGED
+  TASK_DUE_DATE_CHANGED
+  TASK_ARCHIVED
+  TASK_DELETED
+  COMMENT_CREATED
+  COMMENT_UPDATED
+  COMMENT_DELETED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Users & authentication
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  email           String    @unique // normalise to lowercase in the app before saving
+  passwordHash    String? // null for OAuth-only users; store an Argon2id/bcrypt hash, never plaintext
+  name            String    @db.VarChar(120)
+  avatarUrl       String?
+  jobTitle        String?   @db.VarChar(120)
+  timezone        String    @default("UTC")
+  emailVerifiedAt DateTime? @db.Timestamptz(3)
+  lastLoginAt     DateTime? @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt       DateTime? @db.Timestamptz(3) // soft delete keeps history/comments intact
+
+  accounts      Account[]
+  sessions      Session[]
+  memberships   WorkspaceMember[]
+  invitesSent   WorkspaceInvite[]
+  createdBoards Board[]           @relation("BoardCreator")
+  createdTasks  Task[]            @relation("TaskCreator")
+  assignedTasks Task[]            @relation("TaskAssignee")
+  comments      Comment[]
+  activities    ActivityLog[]
+
+  @@map("users")
+}
+
+// OAuth providers (Google, GitHub, ...). One user can link many.
+model Account {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  userId            String   @db.Uuid
+  provider          String
+  providerAccountId String
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+// Refresh-token sessions. Store only a hash of the token so a DB leak can't be replayed.
+model Session {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt]) // for the cleanup job
+  @@map("sessions")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Workspaces (tenants) & memberships
+// ─────────────────────────────────────────────────────────────
+
+model Workspace {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  name      String    @db.VarChar(120)
+  slug      String    @unique @db.VarChar(60) // used in URLs: /w/acme
+  logoUrl   String?
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  members    WorkspaceMember[]
+  invites    WorkspaceInvite[]
+  boards     Board[]
+  activities ActivityLog[]
+
+  @@map("workspaces")
+}
+
+// Join table with a payload (role). Authorization checks start here.
+model WorkspaceMember {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  workspaceId String        @db.Uuid
+  userId      String        @db.Uuid
+  role        WorkspaceRole @default(MEMBER)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId]) // one membership per user per workspace (also serves workspace -> members lookups)
+  @@index([userId]) // "which workspaces am I in?"
+  @@map("workspace_members")
+}
+
+model WorkspaceInvite {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  workspaceId String        @db.Uuid
+  email       String
+  role        WorkspaceRole @default(MEMBER)
+  tokenHash   String        @unique
+  invitedById String?       @db.Uuid
+  expiresAt   DateTime      @db.Timestamptz(3)
+  acceptedAt  DateTime?     @db.Timestamptz(3)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User?     @relation(fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, email])
+  @@index([email])
+  @@map("workspace_invites")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Boards & columns
+// ─────────────────────────────────────────────────────────────
+
+model Board {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  workspaceId String    @db.Uuid
+  name        String    @db.VarChar(120)
+  description String?   @db.Text
+  key         String    @db.VarChar(10) // short prefix for issue ids, e.g. "ENG" -> ENG-42
+  taskCounter Int       @default(0) // increment inside a transaction to allocate Task.number
+  createdById String?   @db.Uuid
+  archivedAt  DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  workspace  Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy  User?         @relation("BoardCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  columns    Column[]
+  tasks      Task[]
+  activities ActivityLog[]
+
+  @@unique([workspaceId, key])
+  @@index([workspaceId, archivedAt])
+  @@map("boards")
+}
+
+model Column {
+  id        String         @id @default(uuid(7)) @db.Uuid
+  boardId   String         @db.Uuid
+  name      String         @db.VarChar(80)
+  category  StatusCategory @default(UNSTARTED)
+  position  Float // fractional index: new position = midpoint of neighbours, so a move touches one row
+  wipLimit  Int? // optional work-in-progress limit (Kanban)
+  createdAt DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime       @updatedAt @db.Timestamptz(3)
+
+  board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  // Required target for Task's composite FK (guarantees a task's column belongs to the task's board).
+  @@unique([id, boardId])
+  @@unique([boardId, name])
+  @@index([boardId, position])
+  @@map("columns")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tasks
+// ─────────────────────────────────────────────────────────────
+
+model Task {
+  id          String       @id @default(uuid(7)) @db.Uuid
+  boardId     String       @db.Uuid
+  columnId    String       @db.Uuid
+  number      Int // per-board sequence => human-friendly ENG-42
+  title       String       @db.VarChar(500)
+  description String?      @db.Text // markdown; switch to Json if you adopt a rich-text editor (TipTap, etc.)
+  priority    TaskPriority @default(NONE)
+  dueDate     DateTime?    @db.Timestamptz(3)
+  position    Float // fractional index within the column
+  assigneeId  String?      @db.Uuid
+  creatorId   String?      @db.Uuid
+  version     Int          @default(1) // optimistic concurrency for real-time edits: UPDATE ... WHERE version = $v
+  completedAt DateTime?    @db.Timestamptz(3)
+  archivedAt  DateTime?    @db.Timestamptz(3)
+  createdAt   DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime     @updatedAt @db.Timestamptz(3)
+
+  board    Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  // Composite FK: column must exist AND belong to the same board.
+  // NoAction (not Restrict) so deleting a whole board can cascade through columns and tasks cleanly,
+  // while deleting a single non-empty column is still rejected at the end of the statement.
+  column   Column @relation(fields: [columnId, boardId], references: [id, boardId], onDelete: NoAction)
+  assignee User?  @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  creator  User?  @relation("TaskCreator", fields: [creatorId], references: [id], onDelete: SetNull)
+
+  comments   Comment[]
+  activities ActivityLog[]
+
+  @@unique([boardId, number])
+  @@index([columnId, position]) // render a column in order (the hottest query)
+  @@index([assigneeId, dueDate]) // "my tasks", sorted by due date
+  @@index([boardId, updatedAt]) // delta sync after a websocket reconnect
+  @@map("tasks")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Comments (threaded, one level deep enforced in the service layer)
+// ─────────────────────────────────────────────────────────────
+
+model Comment {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  taskId    String    @db.Uuid
+  authorId  String?   @db.Uuid
+  parentId  String?   @db.Uuid // null = top-level comment
+  body      String    @db.Text
+  editedAt  DateTime? @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3) // soft delete so replies keep their context ("comment deleted")
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  task    Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author  User?     @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies Comment[] @relation("CommentReplies")
+
+  @@index([taskId, createdAt])
+  @@index([parentId])
+  @@index([authorId])
+  @@map("comments")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Activity log / audit trail (append-only)
+// ─────────────────────────────────────────────────────────────
+
+model ActivityLog {
+  id          BigInt         @id @default(autoincrement()) // monotonic => usable as a "give me events after id N" cursor
+  workspaceId String         @db.Uuid
+  boardId     String?        @db.Uuid
+  taskId      String?        @db.Uuid
+  actorId     String?        @db.Uuid
+  action      ActivityAction
+  // Snapshot + diff so history stays meaningful after deletes, e.g.
+  // { "taskNumber": 42, "title": "Fix login", "from": {"columnId": "..", "name": "Todo"}, "to": {...} }
+  metadata    Json?
+  createdAt   DateTime       @default(now()) @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  board     Board?    @relation(fields: [boardId], references: [id], onDelete: SetNull)
+  task      Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  actor     User?     @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, createdAt(sort: Desc)]) // task activity feed
+  @@index([boardId, createdAt(sort: Desc)]) // board activity feed
+  @@index([workspaceId, createdAt(sort: Desc)]) // workspace-wide audit view
+  @@index([actorId])
+  @@map("activity_logs")
+}
